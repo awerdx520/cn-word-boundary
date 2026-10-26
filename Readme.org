@@ -1,0 +1,230 @@
+#+TITLE: cn-word-boundary
+#+AUTHOR: thomas
+#+LANGUAGE: zh-CN
+#+OPTIONS: toc:2 num:nil
+
+* 一句话简介
+
+=cn-word-boundary= 是一个 Emacs **中文词边界 minor mode**：让 =forward-word= 及其全部派生行为
+在中文内部按**词**（而不是按**字**）移动，且**不改任何键位**。
+
+实现原理只有一条：设置 buffer-local 的 =find-word-boundary-function-table=，并且只把
+=standard-category-table= 里的汉字（category =?C=）映射到自定义边界函数。其余字符保持 =nil=，
+于是英文、标点、中英混排全部回落到 Emacs 默认的 syntax / script 边界，行为完全不变。
+
+命名取意：处理的是「**中文**语境下的**词边界**」，故前缀 =cn-word-boundary-=。
+
+* 功能
+
+- **=forward-word= 派生全覆盖**：只要命令最终走 =forward-word=，就自动受益 ——
+  evil 的 =w= / =b= / =e= / =ge=、=M-f= / =M-b= / =M-d= / =M-DEL=、=kill-word=、
+  =mark-word=、=transpose-words=、=thing-at-point 'word=、isearch 的 =C-w=（按词扩展选区）等。
+- **中英混排行为不变**：只有汉字字符在 table 里有条目；英文单词、数字、标点、空白都走默认边界。
+- **后端可插拔 + 自动降级**：默认用 =cns= 做真分词；二进制 / 词表缺失、进程启动失败、分词异常
+  等任何问题都会**自动降级为逐字边界**并只提示一次，功能始终可用、启动不中断。
+- **不改键位**：不定义任何 keymap、不调用 =cns-mode=（=cns-mode= 会覆盖 7 个基于
+  =forward-word= 的默认键位）。
+- **=count-words= 不受影响**：它走 =forward-word-strictly=，不查 =find-word-boundary-function-table=，
+  中文仍按整块计数 —— 这是有意保留的（见「已知边界」）。
+
+* 安装
+
+** 前置条件
+
+- Emacs 29.1+（=define-globalized-minor-mode= / =char-table= 相关 API 早已稳定）
+- 可选：=straight.el=（两种 recipe 都需要）
+- 可选（仅 =cns= 后端）：=g++=、=make=、能访问 GitHub（首次安装时编译 =cnws= 并拉取词表）
+
+** 方式 A：远端仓库 recipe
+
+#+BEGIN_SRC elisp
+(straight-use-package
+ '(cn-word-boundary :type git
+                    :host github
+                    :repo "awerdx520/cn-word-boundary"
+                    :branch "master"
+                    :files ("cn-word-boundary*.el" (:exclude "cn-word-boundary-autoloads.el"))
+                    :build (:not compile native-compile)))
+
+(require 'cn-word-boundary)
+(global-cn-word-boundary-mode 1)   ; 全局启用（由宿主配置显式调用）
+#+END_SRC
+
+** 方式 B：本地开发仓 recipe
+
+本地开发仓与远端是同一份代码：=:local-repo= 让 straight 软链本地工作树加载，=:repo= /
+=:branch= 保留 upstream 识别（与 =el-chronos= / =seshat-reader= 同款写法）。
+
+#+BEGIN_SRC elisp
+(straight-use-package
+ '(cn-word-boundary :type git
+                    :host github
+                    :repo "awerdx520/cn-word-boundary"
+                    :branch "master"
+                    :local-repo "/home/thomas/Workspace/cn-word-boundary"
+                    :files ("cn-word-boundary*.el" (:exclude "cn-word-boundary-autoloads.el"))
+                    :build (:not compile native-compile)))
+
+(require 'cn-word-boundary)
+(global-cn-word-boundary-mode 1)
+#+END_SRC
+
+- **=:local-repo= 指向开发仓时不要登记 =versions.lock.el=**：straight 对 =:local-repo=
+  使用该工作树的 live HEAD，lock 条目对它无效、且下次 =straight-freeze-versions= 会把当时
+  的 HEAD 写进 lock 造成假固定。同理 =:local-repo= 下不再需要（也不应保留）多余的
+  =repos/<name>= clone。
+- **=:files= 只需覆盖仓库根的两个模块**：=("cn-word-boundary*.el")= 即含主文件与
+  =cn-word-boundary-cns.el=。=:exclude= 是**必须**的：straight 的 autoloads 步骤会生成
+  同名文件 =cn-word-boundary-autoloads.el=，被通配命中后会软链进 build 目录并穿透写回源仓库
+  （方式 B 下即污染 =~/Workspace/cn-word-boundary= 工作树）。straight **不会**自动排除它。
+- **=:build (:not compile native-compile)=** 不产生 =.elc= / =.eln= 副本，源码改动立刻可见；
+  代价是没有编译期告警，改代码后请自己跑 =make lint=。
+
+** 方式 C：手动 =load-path=（无 straight）
+
+#+BEGIN_SRC elisp
+(add-to-list 'load-path "~/Workspace/cn-word-boundary")
+(require 'cn-word-boundary)
+(global-cn-word-boundary-mode 1)
+#+END_SRC
+
+=load-path= 只写**字符串字面量**（绝对路径最稳、=~= 前缀亦可，依赖 HOME 展开）；
+禁止相对路径与 sexp 形态。
+
+** 关于 =cns=（仅 =cns= 后端需要）
+
+`cns` 是第三方包（[[https://github.com/kanglmf/emacs-chinese-word-segmentation][kanglmf/emacs-chinese-word-segmentation]]），
+它把 =cppjieba= 包成常驻进程 =cnws=。本包**不**替你安装它 —— 安装属宿主环境职责，配置层自己声明：
+
+#+BEGIN_SRC elisp
+(use-package cns
+  :straight (:type git
+             :host github
+             :repo "kanglmf/emacs-chinese-word-segmentation"
+             :files ("cns.el")
+             :pre-build (("sh" "-c"
+                          "git submodule update --init --recursive && make")))
+  :defer t)                       ; 不立即加载：后端进程由本包惰性启动
+#+END_SRC
+
+=:pre-build= 会 =git submodule update --init --recursive= 拉取 =cppjieba= 并 =make= 编译
+=cnws= —— 首次安装需要 =g++= / =make= / 网络，耗时以分钟计。**不要在 =:config= 里做这类安装**。
+
+* 用法
+
+** 启用
+
+#+BEGIN_SRC elisp
+(global-cn-word-boundary-mode 1)      ; 全局启用（推荐）
+(cn-word-boundary-mode 1)             ; 或在单个 buffer 里启用
+#+END_SRC
+
+** 排除列表
+
+#+BEGIN_SRC elisp
+(setq cn-word-boundary-excluded-modes
+      '(vterm-mode term-mode eshell-mode shell-mode))
+#+END_SRC
+
+默认就是这四类终端模式：它们里面 =forward-word= 多是 shell 词语义，中文分词边界反而碍事。
+
+** 后端选择
+
+#+BEGIN_SRC elisp
+(setq cn-word-boundary-backend 'cns)          ; 默认：cns 真分词，不可用时降级逐字
+(setq cn-word-boundary-backend 'char)         ; 始终逐字（不依赖任何外部程序）
+(setq cn-word-boundary-backend #'my-segmenter) ; 自定义分词函数（见下）
+#+END_SRC
+
+自定义分词函数接收一个**纯汉字**字符串，返回**各词长度**的列表，例如
+="中华人民共和国"= → =(3 3 1)=（"中华" "人民" "国" 之类，长度之和必须等于字符数）。
+长度之和不等于输入长度时，本包按逐字边界处理，不报错。
+
+** cns 后端路径与缓存
+
+三个 defcustom 的默认值与语义（与实现一致）：
+
+#+BEGIN_SRC elisp
+cn-word-boundary-cns-prog          ; 默认 (executable-find "cnws")，加载适配层时探测一次
+cn-word-boundary-cns-dict-directory ; 默认 nil —— 必须显式设置
+cn-word-boundary-cns-recent-limit   ; 默认 20，缓存最近多少条分词结果
+#+END_SRC
+
+- =cn-word-boundary-cns-prog=：默认在**加载适配层时**按 =PATH= 探测一次 =cnws=；探测不到即
+  =nil=，后端不可用（自动降级逐字）。
+- =cn-word-boundary-cns-dict-directory=：存放 5 份词表的目录。**默认 =nil=，即必须显式设置** ——
+  词表位置与安装方式（straight / 手工 / 发行版包）强相关，本包不猜测路径。
+- =cn-word-boundary-cns-recent-limit=：缓存最近多少条分词结果；越大连续移动越快，代价是内存。
+
+#+BEGIN_SRC elisp
+;; 最省事：把 cnws 装进 PATH，只补词表目录
+(setq cn-word-boundary-cns-dict-directory "/path/to/cppjieba/dict")
+;; 或者两个都显式指定（cnws 不在 PATH 里时）
+(setq cn-word-boundary-cns-prog "/path/to/cnws")
+#+END_SRC
+
+** 重置后端
+
+装好 =cns=（或修好 =cnws= / 词表）之后，不必重启 Emacs：
+
+#+BEGIN_SRC elisp
+M-x cn-word-boundary-reset-backend
+#+END_SRC
+
+它把后端状态清回「未探测」，并对当前 buffer 重新开关一次模式，触发重新探测。
+
+* 后端说明
+
+| 后端 | 语义 | 依赖 | 何时用 |
+|---|---|---|---|
+| =cns=（默认） | 调 =cppjieba= 的 =cnws= 常驻进程做真分词 | 第三方 =cns= 包 + 编译出的 =cnws= + 5 份词表 | 想要「按词移动」的正常情形 |
+| =char= | 逐字边界（每个汉字各自成词） | 无 | 不想引入外部依赖；或只想要「中文里 =M-f= 不跳过整段」的粗粒度行为 |
+| 自定义函数 | 你提供的 =(string) → 长度列表= | 你自己 | 接入其它分词器（=jieba= 的其它封装、词典、LLM …） |
+
+=cns= 后端需要 **5 份词表**（=cppjieba/dict/= 下）：=jieba.dict.utf8=、=hmm_model.utf8=、
+=user.dict.utf8=、=idf.utf8=、=stop_words.utf8=。任一份缺失即视为不可用。
+
+**降级行为**：二进制不存在 / 不可执行、词表不全、=cns= 加载失败、进程起不来、分词抛错 ——
+任一情形都只在**首次**提示一次「cns 后端不可用，降级为逐字边界（原因）」，
+之后该 buffer 静默按逐字处理；不会弹错、不会中断启动。
+
+**进程生命周期**：后端进程**惰性启动** —— 首次在启用本模式的 buffer 里查词边界时按需拉起；
+宿主也可以在空闲时预启动，避免首次移动时等词表加载的约 0.7 秒：
+
+#+BEGIN_SRC elisp
+(cn-word-boundary-schedule-backend)   ; 空闲 2 秒后探测后端；由宿主显式调用
+#+END_SRC
+
+本包顶层不调用它（库加载不得带定时器副作用）。进程意外死亡会在下次使用时被探测到并重置状态、
+尝试重启；最后一个启用本模式的 buffer 关闭后进程会被停掉。
+
+* 已知边界
+
+| 边界 | 事实 |
+|---|---|
+| =count-words= 不受益 | =count-words= / =count-words-region= 走 =forward-word-strictly=，**不读** =find-word-boundary-function-table=，中文仍按整块计数。要按词计数只能自己写 =(while ... (forward-word 1) (setq n (1+ n)))= 循环 |
+| =cnws= 只接受纯汉字 | =cnws= 的 =WIDE_CHAR_SIZE= 硬编码为 **3**，按「字节数 / 3」算长度；含 ASCII 或 emoji 的字符串会算错位置。故只把连续汉字段送进去，混排部分走默认边界 |
+| 四类终端模式默认排除 | =vterm-mode= / =term-mode= / =eshell-mode= / =shell-mode=（见 =cn-word-boundary-excluded-modes=） |
+| 与 =subword-mode= 争用同一变量 | 两者都写 buffer-local 的 =find-word-boundary-function-table=，**后启用者覆盖先启用者**（不报错，仅边界按后者） |
+| 不含 CJK 扩展区之外的「中文字符」判定扩展 | 汉字判据用 category =?C=；韩文、日文假名等不属于 =?C= 的字符走默认边界（若需要，改 =--table= 的构造即可） |
+| 无纯 Elisp 真分词 | =char= 后端只是逐字降级，不是分词（见 =openspec/tech-debt.md= TD-5） |
+
+* 开发
+
+#+BEGIN_SRC sh
+make check-parens   # L1：逐文件括号平衡
+make test           # L2：自动发现并加载 test/*-test.el
+make lint           # L1 补充：字节编译告警（产物落临时目录）
+make full-check     # check-parens + test（提交前唯一门禁）
+#+END_SRC
+
+全部目标用 =emacs -Q --batch=，不依赖 emacsclient、不碰运行中的 daemon。
+
+- 源码两个模块：=cn-word-boundary.el=（主逻辑）+ =cn-word-boundary-cns.el=（cns 适配）。
+- 测试放 =test/*-test.el=，由 =make test= 自动发现（不要在 Makefile 里硬编码文件名）。
+  当前 12 个用例：=test/cn-word-boundary-test.el=（10 个：结构、边界计算、handler 契约、
+  =forward-word= 集成、边界情形、=char= 后端降级、cns 不可用不改写降级状态、全局 mode 排除列表）
+  与 =test/cn-word-boundary-cns-test.el=（2 个：分词 nil 重试、缺 =cnws= 时降级）。测试直接
+  =require= 真实模块，不从源码文本 read-eval 表单，也不启动任何真实 cns 进程。
+- 不生成 =.elc=：=.dir-locals.el= 已对仓库根与 =test/= 设 =no-byte-compile=。
+- 编码约定、不变量清单与已知边界见 =AGENTS.md=；决策与历史取舍见 =openspec/=。

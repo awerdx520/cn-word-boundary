@@ -1,0 +1,11 @@
+# 字节码与原生编译产物
+*.elc
+*.eln
+.eln-cache/
+eln-cache/
+
+# 本地运行时数据（straight / 缓存 / 状态）
+.local/
+
+# 生成物（make autoloads）
+*-autoloads.el
