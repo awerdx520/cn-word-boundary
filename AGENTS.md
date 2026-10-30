@@ -18,7 +18,7 @@ syntax / script 边界，行为完全不变。
 命名由来：包要解决的是「**中文**语境下的**词边界**」，故直接 `cn-word-boundary-` 前缀。
 
 当前状态：**源码与 ERT 已就位**。`cn-word-boundary.el`（主逻辑）与
-`cn-word-boundary-cns.el`（cns 适配）均已实现，`test/` 下有 12 个 ERT 用例
+`cn-word-boundary-cns.el`（cns 适配）均已实现，`test/` 下有 24 个 ERT 用例
 （`make test` 全绿）；`make full-check` = `check-parens` + `test`。
 
 ## 目录结构
@@ -27,8 +27,9 @@ syntax / script 边界，行为完全不变。
 |---|---|---|
 | `cn-word-boundary.el` | 主文件：自定义组、char-table、边界 handler、minor mode + 全局 mode、后端状态与降级 | 已实现 |
 | `cn-word-boundary-cns.el` | `cns` 后端适配：进程启动、词表探测、分词调用、缓存污染修复 | 已实现 |
-| `test/cn-word-boundary-test.el` | 主文件 ERT（结构 / 边界计算 / handler 契约 / `forward-word` 集成 / 边界情形 / 后端降级 / 全局 mode 排除） | 已实现（10 用例） |
+| `test/cn-word-boundary-test.el` | 主文件 ERT（结构 / 边界计算 / handler 契约 / `forward-word` 集成 / 边界情形 / 后端降级 / 全局 mode 排除 / 段级缓存） | 已实现（22 用例，含 12 个 `test-cnwb-cache-*`） |
 | `test/cn-word-boundary-cns-test.el` | cns 适配层 ERT（分词 nil 重试、缺 `cnws` 时降级） | 已实现（2 用例） |
+| `bench/cnwb-bench.el` | 性能基线（`make bench`）：S1c/S1w handler、S2 走完整段（50–4000 字）、S3 冷缓存、S4 短段、S5 降级路径；顶部注释固化 before 基线 | 已建 |
 | `openspec/` | 决策日志（`decisions.md`）与技术债（`tech-debt.md`） | 已建 |
 | `Makefile` | 验证入口：`check-parens` / `test` / `lint` / `full-check` / `clean` | 已建 |
 | `Readme.org` | 用户文档：安装、用法、后端说明、已知边界 | 已建 |
@@ -54,6 +55,9 @@ syntax / script 边界，行为完全不变。
 - **注释与文档用中文**；符号名与文件名用英文。
 - **不生成 `.elc`**：`.dir-locals.el` 已对仓库根与 `test/` 设 `no-byte-compile`。
   `make lint` 的编译产物输出到 `mktemp -d` 临时目录，跑完即删。
+- **段级缓存两条铁律**：① 缓存是纯派生数据，删掉只能变慢、不能变错；②
+  `cn-word-boundary--run-cache` 与 `cn-word-boundary--bounds-cache` 严格隔离，后者键必须含
+  「实际分词行为」（默认分词器符号 + `cn-word-boundary-backend` 值）。详见不变量 I12。
 - 送进分词器的文本、后端进程的异常路径必须由 `condition-case` 兜住——**任何失败都不得向
   宿主抛错**，只能降级为逐字边界。
 - **cns 侧的全局符号只在编译期声明**：`cn-word-boundary-cns.el` 顶层用
@@ -65,7 +69,7 @@ syntax / script 边界，行为完全不变。
 
 ## 不变量清单
 
-以下 I1–I11 为**现行**不变量，违反即失败。每条给出**判据**（可机械检查或可逐字复核）。
+以下 I1–I12 为**现行**不变量，违反即失败。每条给出**判据**（可机械检查或可逐字复核）。
 
 - **I1 命名空间唯一** —— 全部公共符号以 `cn-word-boundary-` 开头、内部符号以
   `cn-word-boundary--` 开头；**源码（`*.el` / `test/*.el`）内不得出现** `+thomas/` 前缀
@@ -125,8 +129,9 @@ syntax / script 边界，行为完全不变。
   全局启用由**宿主配置**显式调用。*理由*：库的加载时机由宿主的包管理器决定；自带自启动会让
   「只想试一下」或「在隔离实例里加载测试」的场景无法回退。
   *判据*：`emacs -Q --batch -L . -l cn-word-boundary` 之后
-  `(bound-and-true-p global-cn-word-boundary-mode)` 为 `nil`，且 `(timer-list)` 无新增项、
-  `(process-list)` 无新增进程。
+  `(bound-and-true-p global-cn-word-boundary-mode)` 为 `nil`，且 `timer-list` 无新增项、
+  `(process-list)` 无新增进程。注：Emacs 32 起 `timer-list` 是**变量**而非函数，照抄成函数
+  调用形式会 `void-function`（应为 `nil`），按变量比较定时器数量即可。
 
 - **I10 验证入口唯一、不产生编译产物** —— 提交前必须 `make full-check`（= `check-parens` +
   `test`）全绿；仓库内**不得**出现 `.elc` / `.eln`（`.dir-locals.el` 的 `no-byte-compile` 已设，
@@ -143,6 +148,20 @@ syntax / script 边界，行为完全不变。
   `emacs -Q --batch -L . -l cn-word-boundary --eval` 打印
   `state-after-fail=degraded`。
 
+- **I12 缓存失效完备性** —— 段级缓存是**纯派生数据**：任何时刻删掉它只能影响速度，不得影响正确性。
+  两个缓存变量**严格隔离**：`cn-word-boundary--run-cache`（汉字段完整范围，仅
+  `cn-word-boundary--han-run` 读写）与 `cn-word-boundary--bounds-cache`（区间 → 边界列表 + 升序向量，
+  仅 `cn-word-boundary--boundaries` 与 `cn-word-boundary--bounds-vector` 读写）。
+  `--bounds-cache` 的键必须同时覆盖 `buffer-chars-modified-tick`、`point-min`、`point-max`、
+  **实际分词行为**（默认分词器符号 + `cn-word-boundary-backend` 的值）、区间首尾。
+  `cn-word-boundary-mode` 关闭时必须 `kill-local-variable` 两个变量；
+  `cn-word-boundary-reset-backend` 必须把两者置 `nil`。
+  *判据*：`make test` 中 `test-cnwb-cache-*` 全部通过（命中计数、编辑失效、narrow 失效、
+  分词函数切换失效、backend 值切换失效、mode 关闭清理、跨段重算、0 长度项等价、双槽隔离、
+  indirect buffer、list/vector 一致）；且 `grep -n 'cn-word-boundary--run-cache' cn-word-boundary.el`
+  不出现在 `--boundaries` / `--bounds-vector` / `--compute-boundaries` 函数体内，
+  `grep -n 'cn-word-boundary--bounds-cache' cn-word-boundary.el` 不出现在 `--han-run` 函数体内。
+
 ## 常用命令
 
 ```sh
@@ -150,6 +169,7 @@ make check-parens   # L1：逐文件括号平衡（无 .el 时空跑成功）
 make test           # L2：自动发现并加载全部 test/*-test.el（无测试文件时空跑成功）
 make lint           # L1 补充：字节编译告警（产物落临时目录，不污染仓库）
 make full-check     # check-parens + test（提交前的唯一门禁）
+make bench          # 性能基线（不进 full-check；约 12 秒）
 make clean          # 清理 .elc / .eln / eln-cache
 ```
 
@@ -178,6 +198,8 @@ make clean          # 清理 .elc / .eln / eln-cache
 | 与 `subword-mode` 互斥覆盖 | 两者都写 buffer-local 的 `find-word-boundary-function-table`，**后启用者覆盖先启用者**（不报错，仅边界按后者） |
 | cns 是外部 C++ 依赖 | 首次安装需 `g++` / `make` / 网络；不可用时降级逐字并只提示一次（TD-1） |
 | 无纯 Elisp 真分词 | `char` 后端只是逐字降级，不是分词（TD-5） |
+| 长汉字段首次进入有一次性成本 | 段级缓存冷启动需扫段 + 分词 + 建表（2000 字约 0.5 ms），之后同段移动 O(1)（约 4–5 μs/次）；任何文本修改都会使缓存失效 |
+| 非 buffer 边界的 `limit` 行为变化 | handler 改为「完整段分词后裁剪到 `limit`」，以 region 限制 `forward-word` 时边界可能与旧版不同（更稳定、不随 `limit` 抖动）；`forward-word` / `backward-word` 恒传 buffer 边界，不受影响 |
 
 ## 文档治理
 

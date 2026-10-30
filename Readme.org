@@ -208,6 +208,8 @@ M-x cn-word-boundary-reset-backend
 | 与 =subword-mode= 争用同一变量 | 两者都写 buffer-local 的 =find-word-boundary-function-table=，**后启用者覆盖先启用者**（不报错，仅边界按后者） |
 | 不含 CJK 扩展区之外的「中文字符」判定扩展 | 汉字判据用 category =?C=；韩文、日文假名等不属于 =?C= 的字符走默认边界（若需要，改 =--table= 的构造即可） |
 | 无纯 Elisp 真分词 | =char= 后端只是逐字降级，不是分词（见 =openspec/tech-debt.md= TD-5） |
+| 长汉字段首次进入有一次性成本 | 段级缓存冷启动需要扫段 + 分词 + 建表（2000 字约 =0.5 ms=），之后同一段内的移动是 =O(1)=（约 =4–5 μs= 每次）；任何文本修改都会使缓存失效 |
+| 以 region 限制的 =forward-word= 边界可能与旧版不同 | 本包对完整汉字段分词后再裁剪到 =limit=，旧版对截断区间分词；=forward-word= / =backward-word= 恒传 buffer 边界，日常使用不受影响 |
 
 * 开发
 
@@ -222,8 +224,9 @@ make full-check     # check-parens + test（提交前唯一门禁）
 
 - 源码两个模块：=cn-word-boundary.el=（主逻辑）+ =cn-word-boundary-cns.el=（cns 适配）。
 - 测试放 =test/*-test.el=，由 =make test= 自动发现（不要在 Makefile 里硬编码文件名）。
-  当前 12 个用例：=test/cn-word-boundary-test.el=（10 个：结构、边界计算、handler 契约、
-  =forward-word= 集成、边界情形、=char= 后端降级、cns 不可用不改写降级状态、全局 mode 排除列表）
+  当前 24 个用例：=test/cn-word-boundary-test.el=（22 个：结构、边界计算、handler 契约、
+  =forward-word= 集成、边界情形、=char= 后端降级、cns 不可用不改写降级状态、全局 mode 排除列表、
+  段级缓存正确性（其中 12 个 =test-cnwb-cache-*= 用例））
   与 =test/cn-word-boundary-cns-test.el=（2 个：分词 nil 重试、缺 =cnws= 时降级）。测试直接
   =require= 真实模块，不从源码文本 read-eval 表单，也不启动任何真实 cns 进程。
 - 不生成 =.elc=：=.dir-locals.el= 已对仓库根与 =test/= 设 =no-byte-compile=。

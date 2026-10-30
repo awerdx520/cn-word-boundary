@@ -14,6 +14,26 @@
   2000 字长段、`char` 后端降级、cns 不可用时的状态流转、全局 mode 的排除列表）与
   `test/cn-word-boundary-cns-test.el`（2 例：分词返回 `nil` 时的重试与缓存清理、缺 `cnws` /
   词表时降级）。测试直接 `require` 真实模块，不启动任何真实 cns 进程（一律 mock 或走提前失败路径）。
+- `bench/cnwb-bench.el` 与 `make bench`：性能基线入口（不进 `full-check`）。
+- ERT 缓存正确性用例 11 个（`test-cnwb-cache-*`，覆盖命中计数、编辑/narrow/分词函数/backend
+  失效、mode 关闭清理、跨段重算、0 长度项等价、双槽隔离、indirect buffer、列表与向量一致）。
+
+### Changed
+
+- 中文词边界 handler 的复杂度从 O(n²) 降到段内连续移动 O(1)：新增两个 buffer-local 段级缓存
+  （汉字段完整范围 / 边界表 + 升序向量）。2000 字字段的连续移动由约 1 ms/次降到约 4 μs/次。
+- 边界查找改用升序向量二分（`cn-word-boundary--vec-first-after`），不再从边界表头线性扫描；
+  成本不再随光标位置线性增长。
+- 分词结果的合法性校验与边界表构造合并为单次遍历。
+- `cn-word-boundary--han-run` 改为返回**完整**汉字段，裁剪到 `limit` 的职责移到 handler。
+  **行为变化**：以非 buffer 边界的 `limit` 调用时（如 region 限制的 `forward-word`），边界可能
+  与旧版不同——旧版对截断区间分词、结果随 `limit` 抖动，新版对完整段分词后裁剪，更稳定。
+  `forward-word` / `backward-word` 恒传 buffer 边界，不受影响。
+- 反向查找不再复制边界表（去掉 `cl-remove-if` + `last`）。
+
+### Removed
+
+- `cn-word-boundary.el` 不再 `require 'cl-lib`（已无 `cl-*` 调用）。
 
 ### Fixed
 

@@ -39,6 +39,10 @@
 - **处置**：**不解决**。要保持一致只能两者都读标准表（失去用户自定义能力）或都读运行期表
   （table 需在每次 category 变更后重建，复杂度不成比例）。已在 `AGENTS.md` I2 记录判据，
   改动该处代码时必须两处一起看。
+- **2026-10-30 复核**：性能优化期间评估了「把 `--han-char-p` 判据统一到 `cn-word-boundary--table`」
+  （即消除本 TD 的两套判据漂移）。实测（2000 字全扫，A/B 交替 4 轮 × 3 进程）仅提速 **2–6%**
+  （`--han-run` 冷路径 +2.99%，最大 +6.39%），瓶颈在 `forward-char` / `char-after` 的 buffer 移动
+  而非判据本身，低于 10% 采纳阈值，**未采纳**，本 TD 维持现状。
 
 ## TD-4 `count-words` 不受益
 
@@ -62,3 +66,28 @@
   （`cn-word-boundary-backend` 接受任意 `(string) → 长度列表`），需要的人自己接。
   若日后要内置，优先评估「精简静态词典 + 最大正向匹配」的体积/效果比，并以独立可选模块
   （类似 `cn-word-boundary-cns.el`）的形式提供，不改主文件。
+
+## TD-6 段级缓存的一致性风险与失效边界
+
+- **描述**：性能优化引入两个 buffer-local 段级缓存（`cn-word-boundary--run-cache` /
+  `cn-word-boundary--bounds-cache`，见 `AGENTS.md` I12）。缓存键覆盖
+  `buffer-chars-modified-tick`、`point-min`、`point-max`、实际分词行为、区间首尾，仍有两个
+  已识别边界：
+  1. **运行期 category table 变更**：`cn-word-boundary--han-char-p` 读运行期 category `?C`
+     （TD-3），而 `buffer-chars-modified-tick` **不**随 `modify-category-entry` 改变 →
+     run-cache 可能返回陈旧段范围。
+  2. **indirect buffer**：实测（Emacs 32.0.50）`buffer-chars-modified-tick` **会**跨
+     base / indirect buffer 传播（`6 → 7`），故当前不构成缺口；若未来 Emacs 行为改变需重新评估。
+- **已识别边界（2026-10-30 代码审查）**：
+  1. **custom 分支的键以函数对象为准**：`cn-word-boundary-segmenter-function` 为自定义函数时，
+     `SEGKEY` 是 `(cons 'custom 函数对象)`，用 `equal` 比较。函数体**引用的外部可变状态**
+     （如某个 `defvar` 变量的值）不在键内——若外部状态变化而函数对象不变，缓存会返回陈旧边界。
+     默认分派器分支不受影响（键含 `cn-word-boundary-backend` 的值）。变化后执行
+     `M-x cn-word-boundary-reset-backend` 可清缓存。
+  2. **健康检查被缓存短路**：`--bounds-vector` 的命中路径不调用 `--ensure-ready`，因此 cns 进程
+     意外死亡后，只要文本未变且区间相同，缓存会继续返回**旧的但正确**的边界，降级提示延后到
+     下一次 miss。属「降级时机延迟」而非正确性问题（缓存是纯派生数据）。
+- **影响**：缺口 1 仅在用户运行时修改 `?C` 类别范围时触发，概率极低（TD-3 已声明 `?C` 定义稳定）。
+- **处置**：**不解决**。缺口 1 与 TD-3 绑定——若将来采纳「判据统一到 `standard-category-table`」，
+  该缺口自动消除；当前可用 `M-x cn-word-boundary-reset-backend` 手动清缓存。缺口 2 已由 ERT
+  `test-cnwb-cache-indirect-buffer` 守门。
