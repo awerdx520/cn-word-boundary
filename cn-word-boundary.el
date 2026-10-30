@@ -32,9 +32,6 @@
 
 ;;; Code:
 
-;; cl-lib → `cl-every' / `cl-remove-if' / `cl-loop' / `cl-find-if'
-(require 'cl-lib)
-
 ;;; 配置
 
 (defcustom cn-word-boundary-excluded-modes
@@ -138,6 +135,43 @@ buffer-local 的逐字覆盖，回到正常分词。只在 cns 后端下检查�
 
 ;;; 边界计算
 
+;;; 段级缓存（纯派生数据：删掉只影响速度，不影响正确性）
+
+;; D7 实测结论 = P（tick 传播）：建 base buffer A → 记 `buffer-chars-modified-tick'
+;; → 在 A 的 indirect buffer B 中 insert → A 的 tick 同样递增（实测 A: 4 → 5，
+;; B: 5）。故缓存键用「当前 buffer 的 tick」即可覆盖 base / indirect 兄弟的修改，
+;; 无需对 `buffer-base-buffer' 非 nil 的 buffer 绕过缓存。
+(defvar-local cn-word-boundary--run-cache nil
+  "最近的汉字段范围缓存.
+形如 (TICK MIN MAX START END)：TICK 是写入时的 `buffer-chars-modified-tick'，
+MIN/MAX 是当时的 `point-min'/`point-max'（narrow/widen 不改变 TICK，必须单独比对），
+START..END 是该汉字段的**完整**范围。由 `cn-word-boundary--han-run' 独占读写。")
+
+(defvar-local cn-word-boundary--bounds-cache nil
+  "最近的边界表缓存.
+形如 (TICK MIN MAX SEGKEY START END BOUNDS BOUNDSVEC)。由
+`cn-word-boundary--boundaries'（写入）与 `cn-word-boundary--bounds-vector'（读取）
+共同读写；BOUNDS 是升序位置列表（含 START 与 END），BOUNDSVEC 是同一组位置的
+升序向量（`(vconcat bounds)'，供 handler 二分查找，避免 O(pos) 线性扫描），
+SEGKEY 见 `cn-word-boundary--cache-segmenter-key'。")
+
+(defun cn-word-boundary--cache-fresh-p (cache)
+  "CACHE 的 TICK/MIN/MAX 是否与当前 buffer 状态一致."
+  (and cache
+       (eql (nth 0 cache) (buffer-chars-modified-tick))
+       (eql (nth 1 cache) (point-min))
+       (eql (nth 2 cache) (point-max))))
+
+(defun cn-word-boundary--cache-segmenter-key ()
+  "返回代表「实际分词行为」的缓存键.
+默认分词器 `cn-word-boundary--default-segmenter' 是符号，其函数体实时读
+`cn-word-boundary-backend'，故 backend 改变时符号不变而行为改变——键必须同时
+包含 backend 的值，否则会返回陈旧边界。"
+  (if (eq cn-word-boundary-segmenter-function
+          #'cn-word-boundary--default-segmenter)
+      (cons 'default cn-word-boundary-backend)
+    (cons 'custom cn-word-boundary-segmenter-function)))
+
 (defun cn-word-boundary--han-char-p (char)
   "判断 CHAR 是否为汉字（category ?C）."
   (and char (aref (char-category-set char) ?C)))
@@ -163,38 +197,98 @@ buffer-local 的逐字覆盖，回到正常分词。只在 cns 后端下检查�
     (point)))
 
 (defun cn-word-boundary--han-run (pos limit)
-  "返回 POS 附近汉字段的 (START . END)，不越出 LIMIT.
-POS 小于 LIMIT 时把 POS 当词首字符，否则当词末字符。"
-  (if (< pos limit)
-      (cons (cn-word-boundary--han-start pos (point-min))
-            (cn-word-boundary--han-end pos limit))
-    (let ((anchor (min (point-max) (1+ pos))))
-      (cons (cn-word-boundary--han-start anchor limit)
-            (cn-word-boundary--han-end anchor (point-max))))))
+  "返回 POS 所在**完整**汉字段的 (START . END)，不按 LIMIT 裁剪.
+POS 小于 LIMIT 时把 POS 当词首字符，否则当词末字符（与旧实现一致，只用于决定
+扫描锚点）。裁剪到 LIMIT 的职责已移到 `cn-word-boundary-find-word-boundary'。
+结果按 `buffer-chars-modified-tick' + `point-min'/`point-max' 缓存。"
+  (let ((cache cn-word-boundary--run-cache))
+    (if (and (cn-word-boundary--cache-fresh-p cache)
+             (<= (nth 3 cache) pos)
+             (<= pos (nth 4 cache)))
+        (cons (nth 3 cache) (nth 4 cache))
+      (let* ((anchor (if (< pos limit) pos (min (point-max) (1+ pos))))
+             (start (cn-word-boundary--han-start anchor (point-min)))
+             (end (cn-word-boundary--han-end anchor (point-max))))
+        (setq cn-word-boundary--run-cache
+              (list (buffer-chars-modified-tick) (point-min) (point-max)
+                    start end))
+        (cons start end)))))
+
+(defun cn-word-boundary--compute-boundaries (start end)
+  "对 START..END 分词并返回升序边界位置列表（含 START 与 END）.
+分词结果不合法（某项非自然数，或总长与文本长度不符）或分词器抛错时回退为逐字
+边界。`natnump' 接受 0（与旧实现一致，会产生重复边界位置，不得改为 `cl-plusp'）。"
+  (let* ((text (buffer-substring-no-properties start end))
+         (usable
+          (catch 'cn-word-boundary--bad
+            (let ((lens (condition-case nil
+                            (funcall cn-word-boundary-segmenter-function text)
+                          (error (throw 'cn-word-boundary--bad nil)))))
+              (unless (listp lens) (throw 'cn-word-boundary--bad nil))
+              (let ((sum 0) (pos start) (bounds (list start)))
+                (dolist (len lens)
+                  (unless (natnump len) (throw 'cn-word-boundary--bad nil))
+                  (setq sum (+ sum len)
+                        pos (+ pos len))
+                  (push pos bounds))
+                (unless (= sum (length text)) (throw 'cn-word-boundary--bad nil))
+                (nreverse bounds))))))
+    (or usable (number-sequence start end))))
 
 (defun cn-word-boundary--boundaries (start end)
   "返回 START..END 内的升序边界位置列表（含 START 与 END）.
-分词结果不合法（某项非自然数，或总长与文本长度不符）或分词器抛错时，回退
-为逐字边界。"
+结果按 TICK/MIN/MAX/分词键/区间缓存；返回值可能是缓存内的共享列表，调用方不得
+破坏性修改。"
   (if (>= start end)
       (list start)
     (cn-word-boundary--ensure-ready)
-    (let* ((text (buffer-substring-no-properties start end))
-           (lens (condition-case nil
-                     (funcall cn-word-boundary-segmenter-function text)
-                   (error nil)))
-           (usable (and (listp lens)
-                        (cl-every #'natnump lens)
-                        (= (cl-loop for len in lens sum len)
-                           (length text)))))
-      (if (not usable)
-          (number-sequence start end)
-        (let ((pos start)
-              (bounds (list start)))
-          (dolist (len lens)
-            (setq pos (+ pos len))
-            (push pos bounds))
-          (nreverse bounds))))))
+    (let ((cache cn-word-boundary--bounds-cache)
+          (segkey (cn-word-boundary--cache-segmenter-key)))
+      (if (and (cn-word-boundary--cache-fresh-p cache)
+               (equal (nth 3 cache) segkey)
+               (eql (nth 4 cache) start)
+               (eql (nth 5 cache) end)
+               (nth 6 cache))
+          (nth 6 cache)
+        (let ((bounds (cn-word-boundary--compute-boundaries start end)))
+          ;; SEGKEY 必须在 `--ensure-ready' 之后重新取：它可能刚把
+          ;; `cn-word-boundary-segmenter-function' 改成逐字（降级）或清掉 buffer-local
+          ;; 覆盖（恢复）。用调用后的值作键，降级结果才不会被 ready 状态锁死。
+          (setq cn-word-boundary--bounds-cache
+                (list (buffer-chars-modified-tick) (point-min) (point-max)
+                      (cn-word-boundary--cache-segmenter-key) start end bounds
+                      (vconcat bounds)))
+          bounds)))))
+
+;; 线性扫描是 warm 路径的瓶颈（O(pos)）：handler 命中缓存后仍要从 BOUNDS 表头
+;; 逐个比较，pos 越靠后越慢。故额外缓存升序向量，改二分查找 O(log n)。
+(defun cn-word-boundary--vec-first-after (vec pos)
+  "在升序向量 VEC 中返回第一个大于 POS 的元素的索引；不存在时返回 nil.
+二分查找，O(log (length VEC))。"
+  (let ((lo 0) (hi (length vec)))
+    (while (< lo hi)
+      (let ((mid (/ (+ lo hi) 2)))
+        (if (> (aref vec mid) pos)
+            (setq hi mid)
+          (setq lo (1+ mid)))))
+    (and (< lo (length vec)) lo)))
+
+(defun cn-word-boundary--bounds-vector (start end)
+  "返回 START..END 的边界位置向量（升序），供二分查找使用.
+与 `cn-word-boundary--boundaries' 共用 `cn-word-boundary--bounds-cache'：
+命中时 O(1) 取向量，未命中时由 `--boundaries' 计算并填充缓存。"
+  (if (>= start end)
+      (vector start)
+    (let ((cache cn-word-boundary--bounds-cache)
+          (segkey (cn-word-boundary--cache-segmenter-key)))
+      (if (and (cn-word-boundary--cache-fresh-p cache)
+               (equal (nth 3 cache) segkey)
+               (eql (nth 4 cache) start)
+               (eql (nth 5 cache) end)
+               (nth 7 cache))
+          (nth 7 cache)
+        (cn-word-boundary--boundaries start end)
+        (nth 7 cn-word-boundary--bounds-cache)))))
 
 (defun cn-word-boundary-find-word-boundary (pos limit)
   "`find-word-boundary-function-table' 使用的 handler.
@@ -205,20 +299,24 @@ POS 小于 LIMIT 时返回 POS 之后的首个边界（词尾），否则返回 
     (save-excursion
       (condition-case nil
           (let* ((run (cn-word-boundary--han-run pos limit))
-                 (bounds (cn-word-boundary--boundaries
-                          (car run) (cdr run)))
-                 (found (if (< pos limit)
-                            (cl-find-if (lambda (b) (> b pos)) bounds)
-                          (car (last (cl-remove-if
-                                      (lambda (b) (> b pos))
-                                      bounds))))))
+                 (vec (cn-word-boundary--bounds-vector (car run) (cdr run)))
+                 (idx (cn-word-boundary--vec-first-after vec pos))
+                 (found
+                  (if (< pos limit)
+                      (and idx (aref vec idx))
+                    ;; 反向：二分定位「第一个 > pos」的索引，再取前一个（最后一个
+                    ;; <= pos 的边界）；索引越界即无此边界，返回 nil。
+                    (let ((i (1- (or idx (length vec)))))
+                      (and (>= i 0) (aref vec i))))))
             (cond
              ((null found)
               (if (< pos limit)
                   (min (1+ pos) limit)
                 (max (1- pos) (point-min))))
              ((< pos limit) (min found limit))
-             (t (max found (point-min)))))
+             ;; 完整段化后 found 可能小于 LIMIT（旧实现里段首已被 limit 裁剪，
+             ;; 故天然 >= limit）；此处必须显式夹到 LIMIT 才符合公开契约。
+             (t (max found limit))))
         (error (if (< pos limit)
                    (min (1+ pos) limit)
                  (max (1- pos) (point-min))))))))
@@ -265,6 +363,8 @@ POS 小于 LIMIT 时返回 POS 之后的首个边界（词尾），否则返回 
   "关闭 buffer-local 中文词边界."
   (kill-local-variable 'find-word-boundary-function-table)
   (kill-local-variable 'cn-word-boundary-segmenter-function)
+  (kill-local-variable 'cn-word-boundary--run-cache)
+  (kill-local-variable 'cn-word-boundary--bounds-cache)
   (when (fboundp 'cn-word-boundary-cns-unregister-buffer)
     (cn-word-boundary-cns-unregister-buffer))
   (remove-hook 'kill-buffer-hook #'cn-word-boundary--on-kill t))
@@ -306,6 +406,7 @@ POS 小于 LIMIT 时返回 POS 之后的首个边界（词尾），否则返回 
   "重置后端探测状态，并对当前 buffer 重新启用本模式."
   (interactive)
   (setq cn-word-boundary--backend-state 'unknown)
+  (setq cn-word-boundary--run-cache nil cn-word-boundary--bounds-cache nil)
   (when (fboundp 'cn-word-boundary-cns-reset)
     (cn-word-boundary-cns-reset))
   (when cn-word-boundary-mode

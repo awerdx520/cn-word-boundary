@@ -244,5 +244,303 @@
       (cn-word-boundary--turn-on-maybe)
       (should cn-word-boundary-mode))))
 
+;;; 缓存
+
+;; 本节覆盖 `cn-word-boundary--run-cache' / `cn-word-boundary--bounds-cache' 的
+;; 命中与失效完备性（AGENTS.md I12 的守门用例）。每个用例都在 `with-temp-buffer'
+;; 里独立运行：两个缓存变量是 `defvar-local'，temp buffer 天然隔离，故单跑任意
+;; 一个用例都不会被其它用例的缓存污染。
+;;
+;; 计数一律用词法器闭包（`let' + `setq'）而非 `cl-letf' 替换真实定义：缓存命中
+;; 断言关心的是「分词函数被调了几次」，闭包计数不影响被调函数的语义。
+
+(defun cnwb-test--pair-lens (string)
+  "返回「尽量按词长 2 切分」的长度列表；长度为奇数时末尾补一个 1.
+让缓存断言在插入单个字符后仍保持词长 2 的边界语义，避免落到逐字回退分支。"
+  (let ((n (length string)))
+    (append (make-list (/ n 2) 2) (when (cl-oddp n) (list 1)))))
+
+(ert-deftest test-cnwb-cache-hit-counts-once ()
+  "同段内连续三次调用只分词一次（run-cache 与 bounds-cache 双双命中）。"
+  :tags '(cache)
+  (with-temp-buffer
+    (insert (make-string 20 ?中))
+    (let* ((calls 0)
+           (seg (lambda (s) (setq calls (1+ calls)) (cnwb-test--pair-lens s))))
+      (cnwb-test--with-ready-backend seg
+        ;; a) 三次调用（pos 依次前移一个词）命中的是同一段的同一份边界表
+        (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+        (should (= 5 (cn-word-boundary-find-word-boundary 3 (point-max))))
+        (should (= 7 (cn-word-boundary-find-word-boundary 5 (point-max))))
+        ;; 分词器只被调用 1 次
+        (should (= calls 1))
+        ;; 缓存自洽：段范围覆盖整个 buffer，边界表含两端
+        (should (equal (list (nth 3 cn-word-boundary--run-cache)
+                             (nth 4 cn-word-boundary--run-cache))
+                       '(1 21)))
+        (should (equal (nth 6 cn-word-boundary--bounds-cache)
+                       (cl-loop for p from 1 to 21 by 2 collect p)))))))
+
+(ert-deftest test-cnwb-cache-invalidated-by-edit ()
+  "文本修改（末尾插入字符）后缓存失效，分词器再被调用且边界正确。"
+  :tags '(cache)
+  (with-temp-buffer
+    (insert (make-string 20 ?中))
+    (let* ((calls 0)
+           (seg (lambda (s) (setq calls (1+ calls)) (cnwb-test--pair-lens s))))
+      (cnwb-test--with-ready-backend seg
+        (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+        (should (= calls 1))
+        ;; b) TICK 维度失效：缓冲区字符改动使 tick 递增
+        (goto-char (point-max))
+        (insert "字")
+        (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+        (should (= calls 2))
+        (should (= 22 (point-max)))
+        (should (equal (list (nth 3 cn-word-boundary--run-cache)
+                             (nth 4 cn-word-boundary--run-cache))
+                       '(1 22)))))))
+
+(ert-deftest test-cnwb-cache-invalidated-by-narrow ()
+  "narrow / widen 后缓存失效（MIN/MAX 维度；narrow 不改 TICK）。"
+  :tags '(cache)
+  (with-temp-buffer
+    (insert (make-string 20 ?中))
+    (let* ((calls 0)
+           (seg (lambda (s) (setq calls (1+ calls)) (cnwb-test--pair-lens s))))
+      (cnwb-test--with-ready-backend seg
+        (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+        (should (= calls 1))
+        ;; c) narrow：TICK 不变，只能靠 MIN/MAX 失效
+        (narrow-to-region 1 5)
+        (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+        (should (= calls 2))
+        (should (= 5 (nth 2 cn-word-boundary--bounds-cache)))
+        ;; widen 后又是一个新上下文（此时缓存里是 narrow 的 MIN/MAX）
+        (widen)
+        (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+        (should (= calls 3))
+        (should (= 21 (nth 2 cn-word-boundary--bounds-cache)))))))
+
+(ert-deftest test-cnwb-cache-invalidated-by-segmenter ()
+  "切换 `cn-word-boundary-segmenter-function' 后缓存失效（SEGKEY custom 维度）。"
+  :tags '(cache)
+  (with-temp-buffer
+    (insert "中文分词测试")
+    (let* ((x-calls 0)
+           (y-calls 0)
+           (segx (lambda (_s) (setq x-calls (1+ x-calls)) '(2 2 2)))
+           (segy (lambda (_s) (setq y-calls (1+ y-calls)) '(3 3))))
+      (cnwb-test--with-ready-backend segx
+        (should (= 3 (cn-word-boundary-find-word-boundary 1 7)))
+        (should (= x-calls 1))
+        ;; d) 换分词器：符号层面是另一个函数对象，SEGKEY 随之改变
+        (setq cn-word-boundary-segmenter-function segy)
+        (should (= 4 (cn-word-boundary-find-word-boundary 1 7)))
+        (should (= y-calls 1))
+        ;; 旧分词器不再被调用（没有重复分词）
+        (should (= x-calls 1))))))
+
+(ert-deftest test-cnwb-cache-invalidated-by-backend ()
+  "分词器符号不变、只改 `cn-word-boundary-backend' 值时缓存仍失效。
+这是 SEGKEY 必须包含 backend 值（而非只含函数符号）的回归守卫。"
+  :tags '(cache)
+  (with-temp-buffer
+    (insert "中文分词测试")
+    (let ((cn-word-boundary-backend 'char)
+          (char-calls 0))
+      ;; 分词器固定为默认分派器（符号不变），行为只由 backend 决定
+      (cnwb-test--with-ready-backend #'cn-word-boundary--default-segmenter
+        (cl-letf (((symbol-function 'cn-word-boundary--char-segmenter)
+                   (lambda (s)
+                     (setq char-calls (1+ char-calls))
+                     (make-list (length s) 1))))
+          ;; e) `char' 后端：逐字边界 → 首个边界是 POS+1
+          (should (= 2 (cn-word-boundary-find-word-boundary 1 (point-max))))
+          (should (= char-calls 1))
+          (should (equal (nth 3 cn-word-boundary--bounds-cache)
+                         (cons 'default 'char)))
+          ;; 只把 backend 换成自定义函数，分词器符号仍是默认分派器
+          (setq cn-word-boundary-backend (lambda (_s) '(3 3)))
+          (should (= 4 (cn-word-boundary-find-word-boundary 1 (point-max))))
+          ;; 重算但不再走 `char' 分支（新 backend 直接产出 '(3 3)）
+          (should (= char-calls 1))
+          (should-not (equal (nth 3 cn-word-boundary--bounds-cache)
+                             (cons 'default 'char))))))))
+
+(ert-deftest test-cnwb-cache-cleared-on-disable ()
+  "关闭 mode 后两个缓存都被 `kill-local-variable' 清除。"
+  :tags '(cache)
+  (with-temp-buffer
+    (insert (make-string 20 ?中))
+    (cnwb-test--with-ready-backend (lambda (s) (cnwb-test--pair-lens s))
+      (cn-word-boundary-mode 1)
+      (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+      ;; f) 两个缓存此刻都已写入
+      (should (local-variable-p 'cn-word-boundary--run-cache))
+      (should (local-variable-p 'cn-word-boundary--bounds-cache))
+      (cn-word-boundary-mode -1)
+      ;; disable 后不再有 buffer-local 值，读到的只能是全局默认值 nil
+      (should-not (local-variable-p 'cn-word-boundary--run-cache))
+      (should-not (local-variable-p 'cn-word-boundary--bounds-cache))
+      (should-not cn-word-boundary--run-cache)
+      (should-not cn-word-boundary--bounds-cache))))
+
+(ert-deftest test-cnwb-cache-recomputes-across-runs ()
+  "POS 落在缓存段之外（跨标点进入另一汉字段）时重算且结果正确。"
+  :tags '(cache)
+  (with-temp-buffer
+    (insert "中文abc分词")
+    (let* ((calls 0)
+           (seg (lambda (s) (setq calls (1+ calls)) (cnwb-test--pair-lens s))))
+      (cnwb-test--with-ready-backend seg
+        ;; g) 第一个汉字段 1..3
+        (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+        (should (= calls 1))
+        (should (equal (list (nth 3 cn-word-boundary--run-cache)
+                             (nth 4 cn-word-boundary--run-cache))
+                       '(1 3)))
+        ;; 第二个汉字段 6..8：POS 不在缓存段内 → run-cache 重算
+        (should (= 8 (cn-word-boundary-find-word-boundary 6 (point-max))))
+        (should (= calls 2))
+        (should (equal (list (nth 3 cn-word-boundary--run-cache)
+                             (nth 4 cn-word-boundary--run-cache))
+                       '(6 8)))))))
+
+(ert-deftest test-cnwb-cache-zero-length-lens ()
+  "0 长度项产生重复边界位置，且向量二分与线性语义一致（D2 守门）。"
+  :tags '(cache)
+  (with-temp-buffer
+    (insert "中文分词测试")
+    (cnwb-test--with-ready-backend (lambda (_s) '(2 0 2 2))
+      ;; h) 实测值（2026-10-30 实测，勿凭推算修改）：`natnump' 接受 0，
+      ;; 0 长度项不推进 pos，于是 3 被重复 push 两次，边界面为 (1 3 3 5 7)。
+      (should (equal (cn-word-boundary--boundaries 1 7) '(1 3 3 5 7)))
+      (should (equal (nth 7 cn-word-boundary--bounds-cache) [1 3 3 5 7]))
+      ;; 向量二分在重复边界下必须与线性语义逐位置一致（正反向）
+      (let ((vec (nth 7 cn-word-boundary--bounds-cache))
+            (bounds (nth 6 cn-word-boundary--bounds-cache)))
+        (dotimes (i 8)
+          (let* ((pos (1+ i))
+                 (idx (cn-word-boundary--vec-first-after vec pos))
+                 (lin-fwd (cl-find-if (lambda (b) (> b pos)) bounds))
+                 (vi (1- (or idx (length vec))))
+                 (lin-bwd (car (last (cl-remove-if (lambda (b) (> b pos))
+                                                   bounds)))))
+            (should (equal (and idx (aref vec idx)) lin-fwd))
+            (should (equal (and (>= vi 0) (aref vec vi)) lin-bwd)))))
+      ;; handler 侧同样跳过重复边界：pos=3 的下一词界是 5 而非重复的 3
+      (should (= 3 (cn-word-boundary-find-word-boundary 1 7)))
+      (should (= 5 (cn-word-boundary-find-word-boundary 3 7)))
+      (should (= 3 (cn-word-boundary-find-word-boundary 4 1))))))
+
+(ert-deftest test-cnwb-cache-slot-isolation ()
+  "直接调用 `--boundaries' 只写 bounds-cache，不污染 run-cache（双槽隔离）。"
+  :tags '(cache)
+  (with-temp-buffer
+    (insert "中文分词测试")
+    (cnwb-test--with-ready-backend (lambda (_s) '(2 2 2))
+      (should (equal (cn-word-boundary--boundaries 1 7) '(1 3 5 7)))
+      ;; i) 槽结构：8 槽；bounds-cache 有值而 run-cache 仍为 nil
+      (should (= 8 (length cn-word-boundary--bounds-cache)))
+      (should (equal (nth 6 cn-word-boundary--bounds-cache) '(1 3 5 7)))
+      (should (local-variable-p 'cn-word-boundary--bounds-cache))
+      (should-not cn-word-boundary--run-cache)
+      (should-not (local-variable-p 'cn-word-boundary--run-cache)))))
+
+(ert-deftest test-cnwb-cache-indirect-buffer ()
+  "经 indirect buffer 修改文本后，base buffer 的缓存同样失效（D7 结论 P）。"
+  :tags '(cache)
+  (let ((base (generate-new-buffer " *cnwb-base*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer base
+            (insert (make-string 20 ?中)))
+          (let ((calls 0))
+            (cnwb-test--with-ready-backend
+                (lambda (s) (setq calls (1+ calls)) (cnwb-test--pair-lens s))
+              (with-current-buffer base
+                (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+                (should (= calls 1)))
+              (let ((ind (make-indirect-buffer base " *cnwb-ind*" t)))
+                (unwind-protect
+                    (progn
+                      (with-current-buffer ind
+                        (goto-char (point-max))
+                        (insert "字"))
+                      ;; j) `buffer-chars-modified-tick' 跨 base / indirect 传播
+                      ;; （实测 P：base tick 6 → 7），故 base 端按 tick 判失效即可
+                      (with-current-buffer base
+                        (should (= 22 (point-max)))
+                        (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+                        (should (= calls 2))
+                        (should (equal (list (nth 3 cn-word-boundary--run-cache)
+                                             (nth 4 cn-word-boundary--run-cache))
+                                       '(1 22)))))
+                  (kill-buffer ind))))))
+      (kill-buffer base))))
+
+(ert-deftest test-cnwb-cache-indirect-tick ()
+  "间接缓冲区等长替换后 base 端缓存按 tick 失效（D7 结论 P；point-max 不变）.
+本用例刻意用 `subst-char-in-region' 做**等长替换**，使 `point-max' 严格不变，
+从而排除「失效来自 MIN/MAX 维度」的替代解释 —— 缓存失效只可能来自
+`buffer-chars-modified-tick' 跨 base / indirect 的传播（D7 结论 P）。
+若某天 Emacs 行为改变使 tick 不再传播，本用例会失败，届时须改走 D7 结论 Q 的
+绕过策略（显式比较 base 与 indirect 的 tick，或在间接缓冲区里关掉缓存）。"
+  :tags '(cache)
+  (with-temp-buffer
+    ;; `make-indirect-buffer' 需要一个具名的 base buffer
+    (rename-buffer "cnwb-indirect-base" t)
+    (insert (make-string 20 ?中))
+    (let* ((base (current-buffer))
+           (calls 0)
+           (seg (lambda (s) (setq calls (1+ calls)) (cnwb-test--pair-lens s)))
+           tick0 point-max0)
+      (cnwb-test--with-ready-backend seg
+        ;; l) base 端首轮：分词一次，并记录 tick / point-max 作为对照基准
+        (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+        (should (= calls 1))
+        (setq tick0 (buffer-chars-modified-tick))
+        (setq point-max0 (point-max))
+        (let ((ind (make-indirect-buffer base "cnwb-indirect-tick" t)))
+          (unwind-protect
+              (progn
+                (with-current-buffer ind
+                  ;; m) 等长替换：5..6 的「中」→「文」，长度严格不变
+                  (subst-char-in-region 5 6 ?中 ?文)
+                  ;; n) 间接缓冲区的 point-max 未变 → 失效不可能来自 MIN/MAX 维度
+                  (should (= point-max0 (point-max))))
+                (with-current-buffer base
+                  ;; o) tick 已跨 base / indirect 推进（结论 P 的直接证据）
+                  (should (/= tick0 (buffer-chars-modified-tick)))
+                  (should (= point-max0 (point-max)))
+                  ;; p) 缓存按 tick 失效 → 重新分词一次，边界表仍逐词长 2
+                  (should (= 3 (cn-word-boundary-find-word-boundary 1 (point-max))))
+                  (should (= calls 2))
+                  (should (equal (nth 6 cn-word-boundary--bounds-cache)
+                                 (cl-loop for p from 1 to 21 by 2 collect p)))))
+            (when (buffer-live-p ind) (kill-buffer ind))))))))
+
+(ert-deftest test-cnwb-cache-bounds-vector-consistent ()
+  "bounds-cache 的列表槽与向量槽内容一致、长度相同（D8 结构自洽）。"
+  :tags '(cache)
+  (with-temp-buffer
+    (insert "中文分词测试")
+    (cnwb-test--with-ready-backend (lambda (_s) '(2 2 2))
+      (cn-word-boundary--boundaries 1 7)
+      (let* ((cache cn-word-boundary--bounds-cache)
+             (bounds (nth 6 cache))
+             (vec (nth 7 cache)))
+        (should (equal bounds '(1 3 5 7)))
+        (should (vectorp vec))
+        ;; k) 两槽长度相同且逐元素相等
+        (should (= (length bounds) (length vec)))
+        (should (cl-loop for b in bounds for i from 0
+                         always (and (< i (length vec)) (= b (aref vec i)))))
+        ;; 键与当前上下文一致（缓存是本次调用的产物）
+        (should (equal (nth 3 cache) (cn-word-boundary--cache-segmenter-key)))
+        (should (eql (nth 4 cache) 1))
+        (should (eql (nth 5 cache) 7))))))
+
 (provide 'cn-word-boundary-test)
 ;;; cn-word-boundary-test.el ends here

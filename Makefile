@@ -9,7 +9,7 @@ EMACS ?= emacs
 EL_FILES := $(shell find . -name '*.el' -not -path './.git/*' -not -path './.local/*' -not -name '*-autoloads.el' 2>/dev/null)
 TEST_FILES := $(sort $(wildcard test/*-test.el))
 
-.PHONY: all check-parens test lint full-check clean
+.PHONY: all check-parens test lint full-check bench clean
 
 all: full-check
 
@@ -48,6 +48,11 @@ lint:
 	fi
 
 full-check: check-parens test
+
+# 性能基线（不进 full-check：耗时约半分钟，且不属于正确性门禁）
+# 输出即为 bench/cnwb-bench.el 顶部注释里那组数字的复现入口。
+bench: ## 性能基线（不进 full-check）
+	$(EMACS) -Q --batch -L . -l bench/cnwb-bench.el
 
 clean:
 	rm -rf .eln-cache eln-cache
